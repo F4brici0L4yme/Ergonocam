@@ -9,7 +9,7 @@ import numpy as np
 import random
 import pymunk
 import threading
-import os # Para verificar archivos
+import os 
 
 # --- CONFIGURACIÓN ---
 MODEL_PATH = 'small640.pt' 
@@ -52,27 +52,34 @@ class VisionThread(threading.Thread):
         self.back_bad = False
         self.leg_bad = False
         self.leg_angle = 0
-        self.hand_raised = False 
-        
         self.yolo_box = None
         self.pose_points = None
-        
-        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        
+        self.hand_raised = False
+
+        print('Comprobando CUDA...')
+        if torch.cuda.is_available():
+            device_idx = torch.cuda.current_device()
+            self.device = f'cuda:{device_idx}'
+            print(f'Inferencia GPU activada en: {torch.cuda.get_device_name(device_idx)}')
+        else:
+            self.device = 'cpu'
+            print('Inferencia CPU activada')
+
         try:
             self.model = yolov5.load(MODEL_PATH, device=self.device)
-            self.model.conf = 0.50 
+            self.model.conf = 0.50
             self.model.iou = 0.50
+            self.model.classes = [0, 1]
+            self.model.multi_label = False
             self.model.max_det = 1
-            if self.device == 'cuda': self.model.half()
-        except: 
-            print("Error cargando modelo YOLO")
+        except Exception as e: 
+            print(f"Error cargando modelo YOLO: {e}")
             self.model = None
 
         self.mp_pose = mp.solutions.pose
         self.pose = self.mp_pose.Pose(
             static_image_mode=False,
-            model_complexity=0, 
+            model_complexity=1, 
             smooth_landmarks=True,
             min_detection_confidence=0.5,
             min_tracking_confidence=0.5
@@ -84,7 +91,8 @@ class VisionThread(threading.Thread):
         dot = ba[0]*bc[0] + ba[1]*bc[1]
         mag_ba = math.sqrt(ba[0]**2 + ba[1]**2)
         mag_bc = math.sqrt(bc[0]**2 + bc[1]**2)
-        cos_angle = dot / (mag_ba * mag_bc + 1e-9)
+        if mag_ba * mag_bc == 0: return 0
+        cos_angle = dot / (mag_ba * mag_bc)
         return math.degrees(math.acos(max(min(cos_angle, 1), -1)))
 
     def run(self):
@@ -100,36 +108,39 @@ class VisionThread(threading.Thread):
 
             if do_inference:
                 small_frame = cv2.resize(frame, (320, 240))
-                
-                # 1. YOLO
-                self.back_bad = False 
-                if self.model:
-                    results = self.model(small_frame)
-                    det = results.xyxy[0]
-                    if len(det) > 0:
-                        x1, y1, x2, y2, _, cls = det[0]
-                        scale_x = orig_w / 320; scale_y = orig_h / 240
-                        self.yolo_box = (int(x1*scale_x), int(y1*scale_y), int(x2*scale_x), int(y2*scale_y))
-                        if int(cls) == 1: self.back_bad = True
+                frame_rgb = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
 
-                # 2. MediaPipe
+                self.back_bad = False 
+                self.yolo_box = None
+                
+                if self.model:
+                    try:
+                        results = self.model(frame_rgb)
+                        df_results = results.pandas().xyxy[0].to_dict(orient="records")
+                        
+                        if df_results:
+                            result = df_results[0]
+                            class_id = result['class']  
+                            
+                            x1 = int(result['xmin']); y1 = int(result['ymin'])
+                            x2 = int(result['xmax']); y2 = int(result['ymax'])
+                            
+                            scale_x = orig_w / 320; scale_y = orig_h / 240
+                            self.yolo_box = (int(x1*scale_x), int(y1*scale_y), int(x2*scale_x), int(y2*scale_y))
+
+                            if class_id == 1: 
+                                self.back_bad = True
+                    except Exception as e:
+                        print(f"Error inferencia YOLO: {e}")
+
                 self.leg_bad = False
                 self.hand_raised = False
                 
-                small_rgb = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
-                small_rgb.flags.writeable = False
-                mp_results = self.pose.process(small_rgb)
+                frame_rgb.flags.writeable = False
+                mp_results = self.pose.process(frame_rgb)
                 
                 if mp_results.pose_landmarks:
                     lm = mp_results.pose_landmarks.landmark
-                    
-                    nose_y = lm[0].y
-                    l_wrist_y = lm[15].y
-                    r_wrist_y = lm[16].y
-                    
-                    if l_wrist_y < nose_y or r_wrist_y < nose_y:
-                        self.hand_raised = True
-
                     self.pose_points = {
                         'A': (lm[24].x, lm[24].y), 'B': (lm[26].x, lm[26].y), 'C': (lm[28].x, lm[28].y)
                     }
@@ -141,6 +152,14 @@ class VisionThread(threading.Thread):
                     
                     if not (80 <= self.leg_angle <= 100):
                         self.leg_bad = True
+                        
+                    # --- Detección de Mano Levantada ---
+                    nose_y = lm[0].y
+                    wrist_l_y = lm[15].y
+                    wrist_r_y = lm[16].y
+                    
+                    if wrist_l_y < nose_y or wrist_r_y < nose_y:
+                        self.hand_raised = True
 
             # --- DIBUJO ---
             if self.yolo_box:
@@ -155,8 +174,10 @@ class VisionThread(threading.Thread):
                 C = (int(pts['C'][0] * orig_w), int(pts['C'][1] * orig_h))
                 ln_color = INVALID_COLOR if self.leg_bad else VALID_COLOR
                 cv2.line(frame, A, B, ln_color, 3); cv2.line(frame, B, C, ln_color, 3)
-                cv2.circle(frame, A, 5, (255, 255, 0), -1); cv2.circle(frame, B, 5, (255, 255, 0), -1); cv2.circle(frame, C, 5, (255, 255, 0), -1)
                 cv2.circle(frame, B, 25, ln_color, 3)
+                
+                if self.hand_raised:
+                    cv2.putText(frame, "MANO LEVANTADA", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
 
             self.latest_frame = frame
 
@@ -209,7 +230,7 @@ class AssetManager:
         pygame.draw.line(surface, ROPE_BASE, start_pos, end_pos, 10)
         pygame.draw.line(surface, ROPE_HIGHLIGHT, (start_pos[0], start_pos[1]-3), (end_pos[0], end_pos[1]-3), 4)
 
-# --- STICKMAN ---
+# --- STICKMAN ARTICULADO ---
 class ProceduralStickman:
     def __init__(self, x, y, scale=1.0):
         self.x = x; self.y = y; self.scale = scale; self.walk_cycle = 0.0
@@ -338,9 +359,8 @@ class PhysicalRagdoll:
 class SmoothGame:
     def __init__(self):
         pygame.init()
-        # --- AUDIO INIT ---
         pygame.mixer.init()
-        self.audio_files = ["goku.mp3", "homero.mp3", "messi.mp3", "cristiano.mp3"]
+        self.audio_files = ["goku.mpeg", "homero.mpeg", "messi.mpeg", "cristiano.mpeg"]
         self.loaded_sounds = []
         try:
             for f in self.audio_files:
@@ -461,9 +481,7 @@ class SmoothGame:
             
             if back_bad or leg_bad:
                 self.last_bad_time = time.time()
-                # --- LOGICA DE AUDIO ---
-                # Si detecta mal y pasó el cooldown, reproduce audio aleatorio
-                if (time.time() - self.last_audio_time) > 4.0: # Cooldown de 4 segundos
+                if (time.time() - self.last_audio_time) > 4.0: 
                     if self.loaded_sounds:
                         random.choice(self.loaded_sounds).play()
                         self.last_audio_time = time.time()
